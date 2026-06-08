@@ -1,7 +1,9 @@
+import asyncio
 import os
 import re
 from pathlib import Path
 from typing import Dict, Optional, Union
+from urllib.parse import urlparse
 
 import aiofiles
 import aiohttp
@@ -231,14 +233,81 @@ class FileManager:
                         final_path.name,
                         response.status,
                     )
+                    if self._should_use_curl_fallback(url):
+                        return await self._download_with_curl(
+                            url,
+                            final_path,
+                            tmp_path,
+                            headers=headers,
+                            return_saved_path=return_saved_path,
+                        )
                     return False
         except Exception as e:
             logger.debug("Download error for %s: %s", final_path.name, e)
             tmp_path.unlink(missing_ok=True)
+            if self._should_use_curl_fallback(url):
+                return await self._download_with_curl(
+                    url,
+                    final_path,
+                    tmp_path,
+                    headers=headers,
+                    return_saved_path=return_saved_path,
+                )
             return False
         finally:
             if should_close:
                 await session.close()
+
+    @staticmethod
+    def _should_use_curl_fallback(url: str) -> bool:
+        host = urlparse(url).netloc.lower()
+        return "douyinpic.com" in host
+
+    async def _download_with_curl(
+        self,
+        url: str,
+        final_path: Path,
+        tmp_path: Path,
+        *,
+        headers: Optional[Dict[str, str]] = None,
+        return_saved_path: bool = False,
+    ) -> Union[bool, Path]:
+        tmp_path.unlink(missing_ok=True)
+        cmd = [
+            "curl",
+            "-L",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "300",
+            "--output",
+            str(tmp_path),
+        ]
+        for key, value in (headers or {}).items():
+            normalized_key = key.lower()
+            if normalized_key in {"authorization", "cookie", "proxy-authorization"}:
+                continue
+            cmd.extend(["-H", f"{key}: {value}"])
+        cmd.append(url)
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await process.communicate()
+        if process.returncode != 0:
+            error = stderr.decode("utf-8", errors="ignore").strip()
+            logger.debug("Curl fallback failed for %s: %s", final_path.name, error)
+            tmp_path.unlink(missing_ok=True)
+            return False
+
+        if not tmp_path.exists() or tmp_path.stat().st_size <= 0:
+            tmp_path.unlink(missing_ok=True)
+            return False
+        os.replace(str(tmp_path), str(final_path))
+        return final_path if return_saved_path else True
 
     @classmethod
     def _resolve_save_path_from_content_type(
